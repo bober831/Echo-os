@@ -1,27 +1,37 @@
 name: Build EchoOS ISO
-# Запуск: вкладка Actions -> Build EchoOS ISO -> Run workflow.
-# Готовые ISO появятся в Releases. Исходники системы встроены ниже (base64).
+# Сборка неизменённых исходников EchoOS для UTM SE (ARM64) и обычных ПК (x86_64).
+# Запуск: Actions -> Build EchoOS ISO -> Run workflow.
+
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: echoos-iso-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Build ${{ matrix.arch }} ISO
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: aarch64
             runner: ubuntu-24.04-arm
+            platform: linux/arm64
           - arch: x86_64
             runner: ubuntu-latest
+            platform: linux/amd64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
-      - name: Распаковать исходники EchoOS
+      - name: Prepare unchanged EchoOS sources
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p echoos
           base64 -d > src.tgz <<'B64'
           H4sIAAAAAAAAA+xdW3PbRpb2a/ArOpBsS16RBMCbLA1dS1tMrLIkOhI1SezyqCCiSWFEAgwAWlJs
@@ -467,36 +477,67 @@ jobs:
           gi83b+2cufOfj8XSVHUfwtctVHvv5U+zhlZndHidh2dbs40e5rHW4lDzsLXxBrydxqjvYXUdK3//
           38E3AAAAAAAAAAAAwA+e5CiFVgAIAgA=
           B64
+          gzip -t src.tgz
+          tar -tzf src.tgz >/dev/null
           tar xzf src.tgz -C echoos
-          ls -R echoos | head -40
+          test -x echoos/iso/build.sh || chmod +x echoos/iso/build.sh
+          test -f echoos/iso/mkimg.echoos.sh
+          test -f echoos/iso/genapkovl-echoos.sh
+          echo "EchoOS source archive validated."
 
-      - name: Собрать ISO в контейнере Alpine
+      - name: Build ISO in native-architecture Alpine container
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p out
-          docker run --rm --privileged \
-            -v "$PWD/echoos:/src:ro" -v "$PWD/out:/out" \
+          docker run --rm --pull always --platform "${{ matrix.platform }}" --privileged \
+            -v "$PWD/echoos:/src:ro" \
+            -v "$PWD/out:/out" \
             alpine:latest sh /src/iso/build.sh
-          sudo chown -R "$USER" out
-          for f in out/*.iso; do mv "$f" "out/EchoOS-${{ matrix.arch }}.iso"; done
-          ls -lh out
 
-      - uses: actions/upload-artifact@v4
+          mapfile -t images < <(find out -maxdepth 1 -type f -name '*.iso' -print)
+          if [[ "${#images[@]}" -ne 1 ]]; then
+            echo "Expected exactly one ISO; found ${#images[@]}" >&2
+            find out -maxdepth 2 -type f -ls >&2 || true
+            exit 1
+          fi
+          mv "${images[0]}" "out/EchoOS-${{ matrix.arch }}.iso"
+          test -s "out/EchoOS-${{ matrix.arch }}.iso"
+          ls -lh out/EchoOS-${{ matrix.arch }}.iso
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
         with:
           name: EchoOS-${{ matrix.arch }}
-          path: out/*.iso
+          path: out/EchoOS-${{ matrix.arch }}.iso
           if-no-files-found: error
+          retention-days: 14
 
   release:
+    name: Publish ISO release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Download both architecture builds
+        uses: actions/download-artifact@v4
         with:
           path: isos
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+
+      - name: Verify release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s isos/EchoOS-aarch64.iso
+          test -s isos/EchoOS-x86_64.iso
+          ls -lh isos/*.iso
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: echoos-${{ github.run_number }}
-          name: EchoOS сборка ${{ github.run_number }}
+          name: EchoOS build ${{ github.run_number }}
           files: isos/*.iso
+          fail_on_unmatched_files: true
